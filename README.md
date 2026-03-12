@@ -120,7 +120,11 @@ ASTRA_TOKEN=AstraCS:<your-token>
 Open Docker Desktop and make sure you see the green "Engine running" status.
 
 ### Step 4: Start the API
+
+> Make sure your terminal is inside the `distributed-crud-api` folder, not the parent folder.
+
 ```bash
+cd "distributed-crud-api"
 docker-compose up --build
 ```
 
@@ -271,6 +275,8 @@ docker-compose up --build
 ---
 
 ## Useful Docker Commands
+
+> All commands must be run from inside the `distributed-crud-api` folder.
 
 ```bash
 # Start and build

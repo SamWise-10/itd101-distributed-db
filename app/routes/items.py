@@ -1,13 +1,29 @@
 import asyncio
 import uuid
 from datetime import datetime, timezone
+from enum import Enum
 from typing import List
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 from app.models import ItemCreate, ItemUpdate, ItemResponse, DistributedResponse
 from app.crud import postgres_crud, mysql_crud, mongo_crud, redis_crud, cassandra_crud
 
 router = APIRouter(prefix="/items", tags=["Items"])
+
+
+class DBTarget(str, Enum):
+    all        = "All Databases"
+    postgresql = "PostgreSQL"
+    mysql      = "MySQL"
+    mongodb    = "MongoDB"
+    redis      = "Redis"
+    cassandra  = "Cassandra"
+
+
+def resolve_operations(all_ops: dict, target: DBTarget) -> dict:
+    if target == DBTarget.all:
+        return all_ops
+    return {k: v for k, v in all_ops.items() if k == target.value}
 
 
 async def fan_out_write(operations: dict) -> tuple[list[str], list[str]]:
@@ -28,73 +44,124 @@ async def fan_out_write(operations: dict) -> tuple[list[str], list[str]]:
     "/",
     response_model=DistributedResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Create item in all 5 databases",
-    description="Creates the item in PostgreSQL, MySQL, MongoDB, Redis, and Cassandra simultaneously."
+    summary="Create item — choose target database",
+    description="Creates the item in the selected database(s). Choose **All Databases** to fan out to all 5 at once."
 )
-async def create_item(item: ItemCreate):
+async def create_item(
+    item: ItemCreate,
+    target: DBTarget = Query(default=DBTarget.all, description="Which database(s) to write to")
+):
     item_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    print(f"\n📝 Creating '{item.name}' — fanning out to all 5 databases...")
+    print(f"\n📝 Creating '{item.name}' — target: {target.value}")
 
-    operations = {
+    all_operations = {
         "PostgreSQL": postgres_crud.create_item(item_id, item.name, item.description, item.price, item.quantity, now),
         "MySQL":      mysql_crud.create_item(item_id, item.name, item.description, item.price, item.quantity, now),
         "MongoDB":    mongo_crud.create_item(item_id, item.name, item.description, item.price, item.quantity, now),
         "Redis":      redis_crud.create_item(item_id, item.name, item.description, item.price, item.quantity, now),
         "Cassandra":  asyncio.to_thread(cassandra_crud.create_item, item_id, item.name, item.description, item.price, item.quantity, now),
     }
+    operations = resolve_operations(all_operations, target)
     succeeded, failed = await fan_out_write(operations)
 
     if not succeeded:
-        raise HTTPException(status_code=500, detail="All databases failed. Check logs and verify .env credentials.")
+        raise HTTPException(status_code=500, detail="All selected databases failed. Check logs and verify .env credentials.")
 
     return DistributedResponse(
         item=ItemResponse(id=item_id, name=item.name, description=item.description,
                           price=item.price, quantity=item.quantity, created_at=now, updated_at=now),
         databases_written=succeeded,
         databases_failed=failed,
-        message=f"Item created in {len(succeeded)}/5 databases."
+        message=f"Item created in {len(succeeded)}/{len(operations)} database(s)."
     )
 
 
 @router.get(
     "/",
     response_model=List[ItemResponse],
-    summary="List all items (reads from PostgreSQL)",
+    summary="List all items — choose source database",
+    description="Returns all items from the selected database. Defaults to **All Databases** — reads from PostgreSQL and shows results from the first successful source."
 )
-async def get_all_items():
-    print("\n📋 Fetching all items from PostgreSQL...")
-    try:
-        rows = await postgres_crud.get_all_items()
-        return rows
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def get_all_items(
+    target: DBTarget = Query(default=DBTarget.all, description="Which database to read from")
+):
+    db_label = target.value
+    print(f"\n📋 Fetching all items — target: {db_label}")
+
+    read_map = {
+        "PostgreSQL": lambda: postgres_crud.get_all_items(),
+        "MySQL":      lambda: mysql_crud.get_all_items(),
+        "MongoDB":    lambda: mongo_crud.get_all_items(),
+        "Redis":      lambda: redis_crud.get_all_items(),
+        "Cassandra":  lambda: asyncio.to_thread(cassandra_crud.get_all_items),
+    }
+
+    if target == DBTarget.all:
+        sources = list(read_map.keys())
+    else:
+        sources = [target.value]
+
+    for db_name in sources:
+        try:
+            rows = await read_map[db_name]()
+            print(f"✅ Read {len(rows)} item(s) from {db_name}")
+            return rows
+        except Exception as e:
+            print(f"❌ {db_name} failed: {e}")
+
+    raise HTTPException(status_code=500, detail="All selected databases failed to return items.")
 
 
 @router.get(
     "/{item_id}",
     response_model=ItemResponse,
-    summary="Get item by ID (reads from PostgreSQL)",
+    summary="Get item by ID — choose source database",
+    description="Fetches one item from the selected database. Defaults to **All Databases** — tries each in order until one succeeds."
 )
-async def get_item(item_id: str):
-    print(f"\n🔍 Looking up item {item_id}...")
-    try:
-        item = await postgres_crud.get_item(item_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    if item is None:
-        raise HTTPException(status_code=404, detail=f"Item '{item_id}' not found")
-    return item
+async def get_item(
+    item_id: str,
+    target: DBTarget = Query(default=DBTarget.all, description="Which database to read from")
+):
+    print(f"\n🔍 Looking up item {item_id} — target: {target.value}")
+
+    read_map = {
+        "PostgreSQL": lambda: postgres_crud.get_item(item_id),
+        "MySQL":      lambda: mysql_crud.get_item(item_id),
+        "MongoDB":    lambda: mongo_crud.get_item(item_id),
+        "Redis":      lambda: redis_crud.get_item(item_id),
+        "Cassandra":  lambda: asyncio.to_thread(cassandra_crud.get_item, item_id),
+    }
+
+    if target == DBTarget.all:
+        sources = list(read_map.keys())
+    else:
+        sources = [target.value]
+
+    for db_name in sources:
+        try:
+            item = await read_map[db_name]()
+            if item is not None:
+                print(f"✅ Found in {db_name}")
+                return item
+        except Exception as e:
+            print(f"❌ {db_name} failed: {e}")
+
+    raise HTTPException(status_code=404, detail=f"Item '{item_id}' not found")
 
 
 @router.put(
     "/{item_id}",
     response_model=DistributedResponse,
-    summary="Update item in all 5 databases",
-    description="Updates only the fields you provide. Fans out to all 5 databases."
+    summary="Update item — choose target database",
+    description="Updates only the fields you provide. Choose **All Databases** to update all 5 at once."
 )
-async def update_item(item_id: str, item_update: ItemUpdate):
-    print(f"\n✏️  Updating item {item_id}...")
+async def update_item(
+    item_id: str,
+    item_update: ItemUpdate,
+    target: DBTarget = Query(default=DBTarget.all, description="Which database(s) to update")
+):
+    print(f"\n✏️  Updating item {item_id} — target: {target.value}")
     try:
         existing = await postgres_crud.get_item(item_id)
     except Exception as e:
@@ -103,34 +170,39 @@ async def update_item(item_id: str, item_update: ItemUpdate):
         raise HTTPException(status_code=404, detail=f"Item '{item_id}' not found")
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    operations = {
+    all_operations = {
         "PostgreSQL": postgres_crud.update_item(item_id, item_update.name, item_update.description, item_update.price, item_update.quantity, now),
         "MySQL":      mysql_crud.update_item(item_id, item_update.name, item_update.description, item_update.price, item_update.quantity, now),
         "MongoDB":    mongo_crud.update_item(item_id, item_update.name, item_update.description, item_update.price, item_update.quantity, now),
         "Redis":      redis_crud.update_item(item_id, item_update.name, item_update.description, item_update.price, item_update.quantity, now),
         "Cassandra":  asyncio.to_thread(cassandra_crud.update_item, item_id, item_update.name, item_update.description, item_update.price, item_update.quantity, now),
     }
+    operations = resolve_operations(all_operations, target)
     succeeded, failed = await fan_out_write(operations)
 
     if not succeeded:
-        raise HTTPException(status_code=500, detail="All database updates failed.")
+        raise HTTPException(status_code=500, detail="All selected database updates failed.")
 
     updated = await postgres_crud.get_item(item_id)
     return DistributedResponse(
         item=ItemResponse(**updated),
         databases_written=succeeded,
         databases_failed=failed,
-        message=f"Item updated in {len(succeeded)}/5 databases."
+        message=f"Item updated in {len(succeeded)}/{len(operations)} database(s)."
     )
 
 
 @router.delete(
     "/{item_id}",
     response_model=DistributedResponse,
-    summary="Delete item from all 5 databases",
+    summary="Delete item — choose target database",
+    description="Choose **All Databases** to delete from all 5 at once, or pick one to delete from a single database."
 )
-async def delete_item(item_id: str):
-    print(f"\n🗑️  Deleting item {item_id}...")
+async def delete_item(
+    item_id: str,
+    target: DBTarget = Query(default=DBTarget.all, description="Which database(s) to delete from")
+):
+    print(f"\n🗑️  Deleting item {item_id} — target: {target.value}")
     try:
         existing = await postgres_crud.get_item(item_id)
     except Exception as e:
@@ -139,20 +211,21 @@ async def delete_item(item_id: str):
         raise HTTPException(status_code=404, detail=f"Item '{item_id}' not found")
 
     snapshot = ItemResponse(**existing)
-    operations = {
+    all_operations = {
         "PostgreSQL": postgres_crud.delete_item(item_id),
         "MySQL":      mysql_crud.delete_item(item_id),
         "MongoDB":    mongo_crud.delete_item(item_id),
         "Redis":      redis_crud.delete_item(item_id),
         "Cassandra":  asyncio.to_thread(cassandra_crud.delete_item, item_id),
     }
+    operations = resolve_operations(all_operations, target)
     succeeded, failed = await fan_out_write(operations)
 
     return DistributedResponse(
         item=snapshot,
         databases_written=succeeded,
         databases_failed=failed,
-        message=f"Item deleted from {len(succeeded)}/5 databases."
+        message=f"Item deleted from {len(succeeded)}/{len(operations)} database(s)."
     )
 
 
